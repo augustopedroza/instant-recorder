@@ -221,4 +221,83 @@ class TaskExtractorTest {
     fun `empty transcript`() {
         assertTrue(extract("   ").isEmpty())
     }
+
+    // Whisper writes a pause in speech as a sentence end and capitalizes the next word. The inputs below are
+    // its real output (both models) for sentences spoken with a 1.5–3 s pause in the middle.
+
+    @Test
+    fun `a pause inside a task does not split it`() {
+        val t = extract("I need to call the dentist. About my appointment tomorrow.").single()
+        assertEquals("Call the dentist about my appointment", t.title)
+        assertEquals(LocalDateTime.of(2026, 10, 17, 0, 0), t.due!!.at())
+        assertEquals(
+            listOf("Call the plumber because the sink is leaking again"),
+            extract("Call the plumber. Because the sink is leaking again.").map { it.title },
+        )
+        val report = extract("Remind me to send the report. To Sarah. By Friday.").single()
+        assertEquals("Send the report to Sarah", report.title)
+        assertEquals(LocalDateTime.of(2026, 10, 23, 0, 0), report.due!!.at())
+    }
+
+    @Test
+    fun `timing after a pause belongs to the task before it`() {
+        val friday = extract("Email Sarah the budget numbers. By Friday.").single()
+        assertEquals("Email Sarah the budget numbers", friday.title)
+        assertEquals(LocalDateTime.of(2026, 10, 23, 0, 0), friday.due!!.at())
+        val dentist = extract("Call the dentist. Tomorrow at 3.").single()
+        assertEquals("Call the dentist", dentist.title)
+        assertEquals(LocalDateTime.of(2026, 10, 17, 15, 0), dentist.due!!.at())
+        val plants = extract("Water the plants. Every Monday and Thursday.").single()
+        assertEquals("Water the plants", plants.title)
+        assertEquals(Repeat.of(java.time.DayOfWeek.MONDAY, java.time.DayOfWeek.THURSDAY), plants.repeatDays)
+        val slides = extract("Prepare the slides. Two days before the board meeting.").single()
+        assertEquals("Prepare the slides", slides.title)
+        assertEquals("the board meeting", slides.event!!.query)
+    }
+
+    @Test
+    fun `a pause after the lead-in`() {
+        for (text in listOf(
+            "Remind me to. Call the dentist tomorrow at 3.",
+            "Remind me to... Call the dentist tomorrow at 3.",
+            "Remind me too. Call the dentist tomorrow at 3.",
+            "I need to. Call the dentist tomorrow at 3.",
+        )) {
+            val t = extract(text).single()
+            assertEquals(text, "Call the dentist", t.title)
+            assertEquals(text, LocalDateTime.of(2026, 10, 17, 15, 0), t.due!!.at())
+        }
+        // A lead-in with nothing after it isn't a task either.
+        assertEquals(listOf("Call mom"), extract("Call mom. Remind me to.").map { it.title })
+    }
+
+    @Test
+    fun `a pause after a bare verb or a dangling word`() {
+        assertEquals(
+            listOf("Buy some milk, eggs and bread and some butter"),
+            extract("I need to buy. Some milk, eggs and bread. And some butter.").map { it.title },
+        )
+        // The capital after the pause stays when the word may be a name.
+        assertEquals(listOf("Email Sarah about the budget"), extract("I need to email. Sarah about the budget.").map { it.title })
+        assertEquals(listOf("Follow up with Sarah"), extract("Follow up. With Sarah.").map { it.title })
+        assertEquals(listOf("Send the slides to Sarah"), extract("Send the slides to. Sarah.").map { it.title })
+    }
+
+    @Test
+    fun `an afterthought without a verb continues, one with a verb is a new task`() {
+        assertEquals(listOf("Buy milk and eggs for the cake"), extract("Buy milk. And eggs. For the cake.").map { it.title })
+        assertEquals(listOf("Buy milk", "Call mom"), extract("Buy milk. And call mom tomorrow.").map { it.title })
+        assertEquals(
+            listOf("Email Sarah the budget numbers", "Book the dentist"),
+            extract("Email Sarah the budget numbers. Also book the dentist for next Tuesday.").map { it.title },
+        )
+    }
+
+    @Test
+    fun `a category name is never glued to a task`() {
+        assertEquals(
+            listOf("Book the room" to null, "Call mom" to 1L),
+            categorized("I need to book. The room. Personal: call mom."),
+        )
+    }
 }

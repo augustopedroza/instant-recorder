@@ -44,8 +44,8 @@ data class TaskSuggestion(
 data class CategoryRule(val id: Long, val name: String, val keywords: List<String>)
 
 /**
- * Rule-based, on-device task extraction for English voice notes:
- * split into clauses → pull out dates/times → strip "remind me to"-style lead-ins.
+ * Rule-based, on-device task extraction for English voice notes: glue back sentences that Whisper cut at a
+ * pause → split into clauses → pull out dates/times → strip "remind me to"-style lead-ins.
  */
 object TaskExtractor {
 
@@ -63,7 +63,7 @@ object TaskExtractor {
         if (text.isBlank()) return emptyList()
 
         var spoken: Long? = null
-        val suggestions = text.split(SENTENCE_SPLIT)
+        val suggestions = joinPauses(text.split(SENTENCE_SPLIT), now, categories)
             .flatMap { it.split(CLAUSE_SPLIT) }
             .mapNotNull { rawClause ->
                 var clause = rawClause
@@ -109,6 +109,22 @@ object TaskExtractor {
         }?.id
 
     private fun suggestionFor(clause: String, now: ZonedDateTime): TaskSuggestion? {
+        val c = analyze(clause, now)
+        if (c.title.isEmpty()) return null
+        // Tiny fragments ("Yeah", "I") are leftovers from splitting, not tasks — unless a date or repeat says
+        // otherwise ("Stand-up every weekday at 9").
+        if (c.words.size < 2 && !c.actionable && !c.hasTiming) return null
+        return TaskSuggestion(capitalize(c.title.take(MAX_TITLE)), c.due, c.actionable, repeatDays = c.repeatDays, event = c.event)
+    }
+
+    /** A clause taken apart: what is left for the title once timing and lead-ins are out, and what was found. */
+    private class Clause(val title: String, val due: Due?, val repeatDays: Int, val event: EventRequest?, leadIn: Boolean) {
+        val words: List<String> = if (title.isEmpty()) emptyList() else title.split(' ')
+        val actionable: Boolean = leadIn || (words.isNotEmpty() && words.first().lowercase() in ACTION_VERBS)
+        val hasTiming: Boolean = due != null || repeatDays != Repeat.NONE || event != null
+    }
+
+    private fun analyze(clause: String, now: ZonedDateTime): Clause {
         // "…3 days before the board meeting": the date comes from the calendar later, so take that phrase out first.
         val (event, withoutEvent) = parseEventRequest(clause)
         // Repeats first, so "every Monday" isn't read as a one-off "Monday" date.
@@ -118,20 +134,67 @@ object TaskExtractor {
             val time = parsedDue?.takeIf { it.hasTime }?.let { java.time.Instant.ofEpochMilli(it.epochMillis).atZone(now.zone).toLocalTime() }
             Repeat.first(repeatDays, now, time)
         }
-        var title = stripFillers(withoutDates)
-        val leadIn = LEAD_IN.find(title)
-        if (leadIn != null) title = title.substring(leadIn.range.last + 1)
+        var title = stripFillers(withoutDates).trimEnd(*SENTENCE_END).trimEnd()
+        // The added space lets a lead-in that is the whole clause ("Remind me to.") match as well.
+        val leadIn = LEAD_IN.find("$title ")
+        if (leadIn != null) title = title.substring((leadIn.range.last + 1).coerceAtMost(title.length))
         title = cleanup(stripFillers(title))
-        if (title.isEmpty()) return null
-
-        val words = title.split(' ')
-        val firstWord = words.first().lowercase()
-        val actionable = leadIn != null || firstWord in ACTION_VERBS
-        // Tiny fragments ("Yeah", "I") are leftovers from splitting, not tasks — unless a date or repeat says
-        // otherwise ("Stand-up every weekday at 9").
-        if (words.size < 2 && !actionable && due == null && event == null) return null
-        return TaskSuggestion(capitalize(title.take(MAX_TITLE)), due, actionable, repeatDays = repeatDays, event = event)
+        return Clause(title, due, repeatDays, event, leadIn != null)
     }
+
+    /**
+     * Whisper writes a pause in speech as a sentence end and capitalizes what follows ("Call the dentist. About
+     * my appointment tomorrow."), so a sentence that can't stand alone is glued back onto the one before it.
+     * Sentences that read as a task of their own ("Call John to follow up", "And call mom") stay separate.
+     */
+    private fun joinPauses(sentences: List<String>, now: ZonedDateTime, categories: List<CategoryRule>): List<String> {
+        val joined = mutableListOf<String>()
+        for (sentence in sentences) {
+            val previous = joined.lastOrNull()
+            if (previous != null && continuesPrevious(previous, sentence, now, categories)) {
+                joined[joined.lastIndex] = glue(previous, sentence)
+            } else {
+                joined += sentence
+            }
+        }
+        return joined
+    }
+
+    private fun continuesPrevious(left: String, right: String, now: ZonedDateTime, categories: List<CategoryRule>): Boolean {
+        // A category name ("Work.", "Personal: …") files what follows; it is never part of the task before it.
+        val prefixed = categoryPrefix(left, categories)
+        if (prefixed != null && prefixed.second.isBlank()) return false
+        if (categoryPrefix(right, categories) != null) return false
+        val before = analyze(prefixed?.second ?: left, now)
+        val after = analyze(right, now)
+        // "Remind me to." / "Tomorrow at 3." / "Um.": nothing by itself, whatever follows.
+        if (before.title.isEmpty()) return true
+        // "By Friday." / "Every Monday." / "Two days before the board meeting.": timing for the task before it.
+        if (after.title.isEmpty()) return after.hasTiming
+        // "Call John to follow up." / "And call mom." / "Also book the dentist.": a task of its own.
+        if (after.actionable) return false
+        // "About my appointment", "To Sarah", "Because the sink leaks", "And eggs".
+        val first = firstWord(right)
+        if (first in CONTINUATION_STARTERS || first in CONJUNCTIONS) return true
+        // "I need to buy." / "Follow up." / "…send the report to.": the task before it isn't finished.
+        val bareVerb = before.actionable &&
+            (before.words.size == 1 || before.words.size == 2 && before.words[1].lowercase() in PARTICLES)
+        return bareVerb || lastWord(left) in OPEN_ENDERS
+    }
+
+    private fun glue(left: String, right: String): String {
+        val head = left.trimEnd().trimEnd(*SENTENCE_END).trimEnd()
+        var tail = right.trim()
+        // Whisper capitalizes after its period: undo that for a function word, keep it for what may be a name.
+        if (firstWord(tail) in LOWERCASE_AFTER_PAUSE) tail = tail.replaceFirstChar { it.lowercaseChar() }
+        return "$head $tail"
+    }
+
+    /** First word of [text], lowercased and without punctuation; hesitations ("um") are skipped. */
+    private fun firstWord(text: String): String =
+        WORD.findAll(text).map { it.value.lowercase() }.firstOrNull { it !in HESITATIONS } ?: ""
+
+    private fun lastWord(text: String): String = WORD.findAll(text).lastOrNull()?.value?.lowercase() ?: ""
 
     /** "3 days before X", "the day before X", "a week before X", "2 hours before X" → request + rest of the text. */
     private fun parseEventRequest(text: String): Pair<EventRequest?, String> {
@@ -253,7 +316,7 @@ object TaskExtractor {
     )
     private val LEAD_IN = Regex(
         "^(?:please\\s+)?(?:" +
-            "(?:can you |could you )?remind me (?:to |that i (?:need|have) to |about )|" +
+            "(?:can you |could you )?remind me (?:to |too |that i (?:need|have) to |about )|" +
             "(?:i|we) (?:really |also |still |definitely )?(?:need|have|must|should|want|ought) (?:to )?|" +
             "(?:i|we)(?:'ve| have) got to |(?:i|we) (?:gotta|got to) |(?:i|we)(?:'d| would) like to |" +
             "(?:i|we)(?:'ll| will)(?: need to| have to)? |(?:i'm|i am|we're|we are) (?:going to|gonna) |" +
@@ -266,6 +329,33 @@ object TaskExtractor {
     private val TRAILING_JUNK = Regex(
         """(?:\s+(?:on|at|by|for|in|this|next|the|before|until|around|and|or|to)|[\s,.;:!?-])+$""",
         RegexOption.IGNORE_CASE,
+    )
+
+    private val SENTENCE_END = charArrayOf('.', '!', '?', ';', ',', ':', '\u2026')
+    private val WORD = Regex("""[A-Za-z0-9][A-Za-z0-9':]*""")
+    private val HESITATIONS = setOf("um", "umm", "uh", "uhh", "uhm", "hmm", "hm", "er", "erm", "ah")
+    /** A sentence rarely starts with one of these unless it continues the one before. */
+    private val CONTINUATION_STARTERS = setOf(
+        "about", "after", "along", "among", "around", "as", "at", "because", "before", "between", "by", "concerning",
+        "during", "especially", "except", "for", "from", "if", "in", "including", "instead", "into", "like", "of", "on",
+        "once", "onto", "over", "particularly", "per", "preferably", "re", "regarding", "since", "than", "through",
+        "till", "to", "toward", "towards", "under", "unless", "until", "upon", "via", "when", "whenever", "which",
+        "while", "who", "whom", "whose", "with", "without",
+    )
+    /** These start a new task only when a verb follows ("And call mom"); otherwise they continue ("And eggs"). */
+    private val CONJUNCTIONS = setOf("and", "also", "but", "nor", "or", "plus", "so", "then", "yet")
+    /** A sentence ending in one of these was cut off mid-thought. */
+    private val OPEN_ENDERS = setOf(
+        "a", "about", "after", "an", "and", "around", "as", "at", "because", "before", "but", "by", "during", "each",
+        "every", "for", "from", "her", "his", "if", "in", "into", "its", "like", "my", "next", "of", "on", "or", "our",
+        "per", "re", "regarding", "than", "the", "their", "then", "through", "till", "to", "until", "via", "whether",
+        "with", "without", "your",
+    )
+    /** "Follow up", "Pick up": a verb plus one of these is still a bare verb. */
+    private val PARTICLES = setOf("around", "away", "back", "down", "in", "off", "on", "out", "over", "up")
+    private val LOWERCASE_AFTER_PAUSE = CONTINUATION_STARTERS + CONJUNCTIONS + OPEN_ENDERS + HESITATIONS + setOf(
+        "all", "any", "both", "he", "it", "just", "maybe", "more", "no", "not", "only", "she", "some", "something",
+        "still", "that", "there", "these", "they", "this", "those", "today", "tomorrow", "tonight", "we", "you",
     )
 }
 
