@@ -3,20 +3,18 @@ package app.instantrecorder.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import app.instantrecorder.Notifications
 import app.instantrecorder.app
 import app.instantrecorder.data.Category
 import app.instantrecorder.data.Recording
-import app.instantrecorder.data.RecordingStatus
 import app.instantrecorder.data.Settings
 import app.instantrecorder.data.TaskItem
 import app.instantrecorder.recording.RecorderState
+import app.instantrecorder.recording.RecordingStore
 import app.instantrecorder.recording.RecordingService
 import app.instantrecorder.tasks.Due
 import app.instantrecorder.tasks.EventLink
 import app.instantrecorder.tasks.EventRequest
 import app.instantrecorder.tasks.Reminders
-import app.instantrecorder.tasks.Repeat
 import app.instantrecorder.tasks.TaskStore
 import app.instantrecorder.tasks.TaskSuggestion
 import app.instantrecorder.transcribe.WhisperLib
@@ -33,16 +31,20 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.io.File
 
 /** Something the user can still take back while its snackbar is showing. */
 sealed interface Undoable {
     val message: String
 }
 
-/** A repeating task checked off; [next] is the occurrence that took over. */
+/** A task checked off and moved to the Done tab; [next] is the occurrence that took over a repeating one. */
 data class Completion(val task: TaskItem, val next: TaskItem?) : Undoable {
-    override val message get() = next?.dueAt?.let { "Done · next: ${Due(it, next.dueHasTime).label()}" } ?: "Done"
+    override val message get() = next?.dueAt?.let { "Done · next: ${Due(it, next.dueHasTime).label()}" } ?: "Moved to Done"
+}
+
+/** A finished task unchecked in the Done tab, back in the Tasks list. [task] is how it was while done. */
+data class Reopening(val task: TaskItem) : Undoable {
+    override val message get() = "Back in Tasks"
 }
 
 /** Something the user deleted, still undoable until its snackbar goes away. */
@@ -53,6 +55,11 @@ sealed interface Deletion : Undoable {
 
     data class OfTask(val task: TaskItem) : Deletion {
         override val message get() = "Task deleted"
+    }
+
+    /** "Delete all" in the Done tab. */
+    data class OfTasks(val tasks: List<TaskItem>) : Deletion {
+        override val message get() = if (tasks.size == 1) "Task deleted" else "${tasks.size} tasks deleted"
     }
 }
 
@@ -122,6 +129,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 hiddenTasks.update { it + item.task.id }
                 Reminders.cancel(context, item.task.id) // don't remind about a task that's on its way out
             }
+            is Deletion.OfTasks -> hiddenTasks.update { it + item.tasks.map(TaskItem::id) } // done: no reminders
         }
         pendingUndoables.trySend(item)
     }
@@ -131,10 +139,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         when (item) {
             is Deletion -> undoDeletion(item)
             is Completion -> graph.appScope.launch { TaskStore.undoComplete(context, item.task, item.next) }
+            is Reopening -> graph.appScope.launch { TaskStore.restore(context, item.task) }
         }
     }
 
-    /** The snackbar went away without Undo. Completions are already applied. */
+    /** The snackbar went away without Undo. Completions and reopenings are already applied. */
     fun commit(item: Undoable) {
         if (item is Deletion) commitDeletion(item)
     }
@@ -146,6 +155,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 hiddenTasks.update { it - item.task.id }
                 Reminders.schedule(context, item.task)
             }
+            is Deletion.OfTasks -> hiddenTasks.update { it - item.tasks.map(TaskItem::id).toSet() }
         }
     }
 
@@ -154,17 +164,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         graph.appScope.launch(Dispatchers.IO) {
             when (item) {
                 is Deletion.OfRecording -> {
-                    val current = graph.db.recordings().get(item.recording.id) ?: return@launch
                     // A queued recording can get picked up for transcription while its snackbar is showing.
-                    if (current.status == RecordingStatus.TRANSCRIBING) {
-                        hiddenRecordings.update { it - current.id }
-                    } else {
-                        File(current.filePath).delete()
-                        graph.db.recordings().delete(current)
-                        Notifications.cancelResult(context, current.id)
-                    }
+                    if (!RecordingStore.delete(context, item.recording.id)) hiddenRecordings.update { it - item.recording.id }
                 }
                 is Deletion.OfTask -> TaskStore.delete(context, item.task)
+                is Deletion.OfTasks -> item.tasks.forEach { TaskStore.delete(context, it) }
             }
         }
     }
@@ -180,12 +184,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Either way the task changes tabs, so the snackbar says where it went and offers Undo. */
     fun setTaskDone(task: TaskItem, done: Boolean) {
         viewModelScope.launch {
-            if (done && (task.repeatDays != Repeat.NONE || task.eventRepeats)) {
+            if (done) {
                 pendingUndoables.send(Completion(task, TaskStore.complete(context, task)))
             } else {
-                TaskStore.setDone(context, task, done)
+                TaskStore.setDone(context, task, false)
+                pendingUndoables.send(Reopening(task))
             }
         }
     }

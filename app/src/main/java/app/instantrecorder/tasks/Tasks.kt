@@ -11,6 +11,7 @@ import app.instantrecorder.Notifications
 import app.instantrecorder.app
 import app.instantrecorder.data.Category
 import app.instantrecorder.data.TaskItem
+import app.instantrecorder.recording.RecordingStore
 import kotlinx.coroutines.launch
 import java.time.ZonedDateTime
 import java.util.concurrent.TimeUnit
@@ -86,13 +87,25 @@ object TaskStore {
             context.app.db.tasks().delete(it)
             Reminders.cancel(context, it.id)
         }
-        context.app.db.tasks().update(task.copy(done = false))
-        Reminders.schedule(context, task.copy(done = false))
+        val reopened = task.copy(done = false, completedAt = null)
+        context.app.db.tasks().update(reopened)
+        Reminders.schedule(context, reopened)
+    }
+
+    /** Puts [task] back exactly as it was, e.g. undoing a move back out of the Done tab. */
+    suspend fun restore(context: Context, task: TaskItem) {
+        context.app.db.tasks().update(task)
+        Reminders.schedule(context, task) // cancels it again if the task is done
+        if (task.done) Notifications.cancelReminder(context, task.id)
     }
 
     suspend fun setDone(context: Context, task: TaskItem, done: Boolean) {
         // A completed occurrence stops repeating; its successor carries the repeat on.
-        val updated = if (done) task.copy(done = true, repeatDays = Repeat.NONE, eventRepeats = false) else task.copy(done = false)
+        val updated = if (done) {
+            task.copy(done = true, completedAt = System.currentTimeMillis(), repeatDays = Repeat.NONE, eventRepeats = false)
+        } else {
+            task.copy(done = false, completedAt = null)
+        }
         context.app.db.tasks().update(updated)
         if (done) Reminders.cancel(context, task.id) else Reminders.schedule(context, updated)
         Notifications.cancelReminder(context, task.id)
@@ -257,6 +270,7 @@ class TaskActionReceiver : BroadcastReceiver() {
                 val saved = TaskStore.save(context, recordingId, chosen, transcript)
                 Notifications.showSaved(context, recordingId, saved)
             }
+            ACTION_DELETE_RECORDING -> RecordingStore.delete(context, intent.getLongExtra(EXTRA_RECORDING_ID, -1))
             ACTION_MARK_DONE -> {
                 val task = db.tasks().get(intent.getLongExtra(EXTRA_TASK_ID, -1)) ?: return
                 TaskStore.complete(context, task)
@@ -278,6 +292,7 @@ class TaskActionReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "TaskActionReceiver"
         const val ACTION_SAVE_ALL = "app.instantrecorder.action.SAVE_ALL"
+        const val ACTION_DELETE_RECORDING = "app.instantrecorder.action.DELETE_RECORDING"
         const val ACTION_MARK_DONE = "app.instantrecorder.action.MARK_DONE"
         const val ACTION_REMIND = "app.instantrecorder.action.REMIND"
         const val ACTION_SYNC_EVENTS = "app.instantrecorder.action.SYNC_EVENTS"

@@ -54,6 +54,8 @@ data class TaskItem(
     @ColumnInfo(defaultValue = "0") val eventRepeats: Boolean = false,
     /** Remind like an alarm: alarm sound, through Do Not Disturb, full screen when locked. */
     @ColumnInfo(defaultValue = "0") val important: Boolean = false,
+    /** When it was checked off; null while open. Orders the Done tab. */
+    val completedAt: Long? = null,
 )
 
 @Entity(tableName = "categories")
@@ -158,7 +160,7 @@ interface CategoryDao {
     suspend fun delete(category: Category)
 }
 
-@Database(entities = [Recording::class, TaskItem::class, Category::class], version = 6, exportSchema = false)
+@Database(entities = [Recording::class, TaskItem::class, Category::class], version = 7, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun recordings(): RecordingDao
     abstract fun tasks(): TaskDao
@@ -210,6 +212,14 @@ abstract class AppDatabase : RoomDatabase() {
         val MIGRATION_5_6 = object : Migration(5, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE `tasks` ADD COLUMN `important` INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /** v7: completion time for the Done tab. Tasks finished before it count as finished when created. */
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `tasks` ADD COLUMN `completedAt` INTEGER")
+                db.execSQL("UPDATE `tasks` SET `completedAt` = `createdAt` WHERE `done` = 1")
             }
         }
 

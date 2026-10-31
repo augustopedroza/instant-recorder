@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.Button
@@ -46,8 +47,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -60,7 +59,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
@@ -86,7 +84,6 @@ import app.instantrecorder.tasks.TaskSuggestion
 import app.instantrecorder.tasks.rule
 import app.instantrecorder.transcribe.WhisperModel
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** A suggested task while it's being edited on the review screen. */
@@ -121,9 +118,9 @@ fun ReviewScreen(vm: MainViewModel, recordingId: Long) {
     val context = LocalContext.current
     val recording by remember(recordingId) { vm.recording(recordingId) }.collectAsStateWithLifecycle(null)
     val transcribing by vm.transcribing.collectAsStateWithLifecycle()
-    val snackbar = remember { SnackbarHostState() }
-    val scope = rememberCoroutineScope()
     var menuOpen by remember { mutableStateOf(false) }
+    // How many tasks the last Save created, while the "Delete the recording?" offer is showing.
+    var offerDelete by remember { mutableStateOf<Int?>(null) }
 
     LaunchedEffect(recordingId) { Notifications.cancelResult(context, recordingId) }
 
@@ -206,7 +203,7 @@ fun ReviewScreen(vm: MainViewModel, recordingId: Long) {
                                 val toSave = selected.toList()
                                 vm.saveTasks(recordingId, toSave.map { it.toSuggestion() }, transcript) { count ->
                                     toSave.forEach { it.saved = true }
-                                    scope.launch { snackbar.showSnackbar(if (count == 1) "Task saved" else "$count tasks saved") }
+                                    offerDelete = count
                                 }
                             },
                             enabled = selected.isNotEmpty(),
@@ -224,8 +221,22 @@ fun ReviewScreen(vm: MainViewModel, recordingId: Long) {
                 }
             }
         },
-        snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
+        offerDelete?.let { count ->
+            AlertDialog(
+                onDismissRequest = { offerDelete = null },
+                title = { Text(if (count == 1) "Task saved" else "$count tasks saved") },
+                text = { Text("Delete the recording? The transcript stays in the ${if (count == 1) "task's" else "tasks'"} notes.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        offerDelete = null
+                        vm.open(Route.Home) // where the "Recording deleted · Undo" snackbar lives
+                        rec?.let { vm.delete(Deletion.OfRecording(it)) }
+                    }) { Text("Delete") }
+                },
+                dismissButton = { TextButton(onClick = { offerDelete = null }) { Text("Keep") } },
+            )
+        }
         if (rec == null) return@Scaffold
         LazyColumn(
             Modifier.fillMaxSize(),

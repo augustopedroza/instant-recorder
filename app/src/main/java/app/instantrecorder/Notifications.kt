@@ -137,6 +137,7 @@ object Notifications {
         notify(context, resultId(recording.id), builder.build())
     }
 
+    /** After "Save all": stays until swiped away so its "Delete recording" can still be tapped. */
     fun showSaved(context: Context, recordingId: Long, saved: List<TaskItem>) {
         val n = NotificationCompat.Builder(context, CHANNEL_RESULTS)
             .setSmallIcon(R.drawable.ic_check)
@@ -144,8 +145,18 @@ object Notifications {
             .setContentText(saved.joinToString(", ") { it.title })
             .setSilent(true)
             .setAutoCancel(true)
-            .setTimeoutAfter(6_000)
             .setContentIntent(openApp(context))
+            .addAction(
+                R.drawable.ic_stop,
+                "Delete recording",
+                PendingIntent.getBroadcast(
+                    context,
+                    recordingId.toInt(),
+                    TaskActionReceiver.intent(context, TaskActionReceiver.ACTION_DELETE_RECORDING)
+                        .putExtra(TaskActionReceiver.EXTRA_RECORDING_ID, recordingId),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                ),
+            )
             .build()
         notify(context, resultId(recordingId), n)
     }

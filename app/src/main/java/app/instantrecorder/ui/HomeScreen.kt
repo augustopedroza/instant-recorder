@@ -136,10 +136,13 @@ fun HomeScreen(vm: MainViewModel) {
     var categoryFilter by rememberSaveable { mutableStateOf<Long?>(null) } // null = all
     // An id, not the task, so the editor survives folding/unfolding and always shows the current row.
     var editingTaskId by rememberSaveable { mutableStateOf<Long?>(null) }
-    var tab by rememberSaveable { mutableIntStateOf(0) }
+    var tab by rememberSaveable { mutableIntStateOf(TAB_RECORDINGS) }
+    val openTasks = remember(tasks) { tasks.filterNot { it.done } }
+    // Newest first; the list is shown grouped by the day each was finished.
+    val doneTasks = remember(tasks) { tasks.filter { it.done }.sortedByDescending { it.completedAt ?: it.createdAt } }
 
     val snackbar = remember { SnackbarHostState() }
-    // Shows "… · Undo" for every undoable action: deletes anywhere in the app, checking off a repeating task.
+    // Shows "… · Undo" for every undoable action: deletes anywhere in the app, checking a task off or back on.
     LaunchedEffect(Unit) {
         vm.undoables.collect { item ->
             launch {
@@ -227,11 +230,12 @@ fun HomeScreen(vm: MainViewModel) {
             item { SetupCard(vm) }
             item {
                 PrimaryTabRow(selectedTabIndex = tab) {
-                    Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Recordings") })
-                    Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Tasks (${tasks.count { !it.done }})") })
+                    Tab(selected = tab == TAB_RECORDINGS, onClick = { tab = TAB_RECORDINGS }, text = { Text("Recordings", maxLines = 1) })
+                    Tab(selected = tab == TAB_TASKS, onClick = { tab = TAB_TASKS }, text = { Text("Tasks (${openTasks.size})", maxLines = 1) })
+                    Tab(selected = tab == TAB_DONE, onClick = { tab = TAB_DONE }, text = { Text("Done", maxLines = 1) })
                 }
             }
-            if (tab == 0) {
+            if (tab == TAB_RECORDINGS) {
                 if (recordings.isEmpty()) {
                     item {
                         EmptyHint(
@@ -251,34 +255,12 @@ fun HomeScreen(vm: MainViewModel) {
                     }
                 }
             } else {
-                if (categories.isNotEmpty() && tasks.isNotEmpty()) {
-                    item {
-                        LazyRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                        ) {
-                            item { FilterChip(selected = categoryFilter == null, onClick = { categoryFilter = null }, label = { Text("All") }) }
-                            items(categories, key = { it.id }) { c ->
-                                FilterChip(
-                                    selected = categoryFilter == c.id,
-                                    onClick = { categoryFilter = if (categoryFilter == c.id) null else c.id },
-                                    label = { Text(c.name) },
-                                    leadingIcon = { CategoryDot(c.color) },
-                                )
-                            }
-                        }
-                    }
+                val list = if (tab == TAB_TASKS) openTasks else doneTasks
+                if (categories.isNotEmpty() && list.isNotEmpty()) {
+                    item { CategoryFilterRow(categories, categoryFilter) { categoryFilter = it } }
                 }
-                item {
-                    TextButton(onClick = { editingTaskId = NEW_TASK_ID }, modifier = Modifier.padding(horizontal = 8.dp)) {
-                        Icon(Icons.Filled.Add, null)
-                        Text("Add task", Modifier.padding(start = 8.dp))
-                    }
-                }
-                val shown = if (categoryFilter == null) tasks else tasks.filter { it.categoryId == categoryFilter }
-                if (tasks.isEmpty()) item { EmptyHint("No tasks yet. Record a note and save the tasks it finds, or add one by hand.") }
-                else if (shown.isEmpty()) item { EmptyHint("No tasks in this category.") }
-                items(shown, key = { it.id }) { t ->
+                val shown = if (categoryFilter == null) list else list.filter { it.categoryId == categoryFilter }
+                val taskRow: @Composable (TaskItem) -> Unit = { t ->
                     SwipeToDelete(enabled = true, onDelete = { vm.delete(Deletion.OfTask(t)) }, shape = RectangleShape) {
                         TaskRow(
                             task = t,
@@ -294,7 +276,63 @@ fun HomeScreen(vm: MainViewModel) {
                         )
                     }
                 }
+                if (tab == TAB_TASKS) {
+                    item {
+                        TextButton(onClick = { editingTaskId = NEW_TASK_ID }, modifier = Modifier.padding(horizontal = 8.dp)) {
+                            Icon(Icons.Filled.Add, null)
+                            Text("Add task", Modifier.padding(start = 8.dp))
+                        }
+                    }
+                    when {
+                        openTasks.isEmpty() && doneTasks.isNotEmpty() ->
+                            item { EmptyHint("Nothing left to do. Tasks you've checked off are in the Done tab.") }
+                        openTasks.isEmpty() -> item { EmptyHint("No tasks yet. Record a note and save the tasks it finds, or add one by hand.") }
+                        shown.isEmpty() -> item { EmptyHint("No tasks in this category.") }
+                    }
+                    items(shown, key = { it.id }) { taskRow(it) }
+                } else {
+                    when {
+                        doneTasks.isEmpty() -> item { EmptyHint("Tasks you check off are kept here. Uncheck one to put it back in Tasks.") }
+                        shown.isEmpty() -> item { EmptyHint("No finished tasks in this category.") }
+                        else -> item {
+                            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.End) {
+                                TextButton(onClick = { vm.delete(Deletion.OfTasks(shown)) }) {
+                                    Icon(Icons.Filled.Delete, null)
+                                    val inCategory = categories.firstOrNull { it.id == categoryFilter }?.let { " in ${it.name}" }.orEmpty()
+                                    Text("Delete all$inCategory", Modifier.padding(start = 8.dp))
+                                }
+                            }
+                        }
+                    }
+                    val zone = ZoneId.systemDefault()
+                    shown.groupBy { Instant.ofEpochMilli(it.completedAt ?: it.createdAt).atZone(zone).toLocalDate() }
+                        .forEach { (day, group) ->
+                            item(key = "done-$day") {
+                                SectionHeader(Due(day.atStartOfDay(zone).toInstant().toEpochMilli(), hasTime = false).label())
+                            }
+                            items(group, key = { it.id }) { taskRow(it) }
+                        }
+                }
             }
+        }
+    }
+}
+
+/** "All" plus one chip per category; tapping the selected one goes back to All. */
+@Composable
+private fun CategoryFilterRow(categories: List<Category>, selected: Long?, onSelect: (Long?) -> Unit) {
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+    ) {
+        item { FilterChip(selected = selected == null, onClick = { onSelect(null) }, label = { Text("All") }) }
+        items(categories, key = { it.id }) { c ->
+            FilterChip(
+                selected = selected == c.id,
+                onClick = { onSelect(if (selected == c.id) null else c.id) },
+                label = { Text(c.name) },
+                leadingIcon = { CategoryDot(c.color) },
+            )
         }
     }
 }
@@ -503,10 +541,13 @@ private fun TaskRow(
                 }
             }
         },
-        trailingContent = {
-            Row {
-                IconButton(onClick = onShare) { Icon(Icons.Filled.Share, "Share to another app") }
-                IconButton(onClick = onCalendar) { Icon(Icons.Filled.Event, "Add to calendar") }
+        // Finished tasks don't need sending anywhere.
+        trailingContent = if (task.done) null else {
+            {
+                Row {
+                    IconButton(onClick = onShare) { Icon(Icons.Filled.Share, "Share to another app") }
+                    IconButton(onClick = onCalendar) { Icon(Icons.Filled.Event, "Add to calendar") }
+                }
             }
         },
     )
@@ -523,6 +564,10 @@ fun SectionHeader(text: String) {
 }
 
 private val LOCK_DISTANCE = 96.dp
+
+private const val TAB_RECORDINGS = 0
+private const val TAB_TASKS = 1
+private const val TAB_DONE = 2
 
 /** editingTaskId value for "a new, unsaved task". Real ids start at 1. */
 private const val NEW_TASK_ID = -1L
