@@ -72,14 +72,10 @@ object TaskStore {
      */
     private fun nextForEvent(context: Context, task: TaskItem): TaskItem? {
         val eventId = task.eventId ?: return null
-        val offset = task.eventOffsetMinutes ?: return null
         val after = maxOf(task.eventBegin ?: 0, System.currentTimeMillis())
+        if (task.eventOffsetMinutes == null) return null
         val event = Calendars.followingOccurrence(context, eventId, task.eventTitle, after) ?: return null
-        val due = EventTiming.due(event, offset, java.time.ZoneId.systemDefault())
-        return task.copy(
-            id = 0, done = false, createdAt = System.currentTimeMillis(), dueAt = due.epochMillis, dueHasTime = due.hasTime,
-            eventId = event.eventId, eventBegin = event.begin, eventTitle = event.title, eventAllDay = event.allDay,
-        )
+        return task.copy(id = 0, done = false, createdAt = System.currentTimeMillis()).movedTo(event, java.time.ZoneId.systemDefault())
     }
 
     /** Undoes [complete]: reopens [task] as it was and removes the occurrence it created. */
@@ -141,6 +137,22 @@ object TaskStore {
 }
 
 fun Category.rule() = CategoryRule(id, name, keywordList)
+
+/** This task aimed at [event] instead: the same time before it, with that meeting's date and due date. */
+fun TaskItem.movedTo(event: EventRef, zone: java.time.ZoneId): TaskItem {
+    val due = EventTiming.due(event, eventOffsetMinutes ?: 0, zone)
+    return copy(
+        dueAt = due.epochMillis, dueHasTime = due.hasTime,
+        eventId = event.eventId, eventBegin = event.begin, eventTitle = event.title, eventAllDay = event.allDay,
+    )
+}
+
+/**
+ * A "before every <event>" task whose meeting has started without it being checked off: getting ready for
+ * that meeting no longer matters, so it moves on to the next one (quietly, nothing goes to Done).
+ * Weekday repeats don't do this: a missed chore is still worth doing.
+ */
+fun TaskItem.missedItsMeeting(now: Long): Boolean = !done && eventRepeats && eventBegin != null && eventBegin <= now
 
 /**
  * A task's tie to a calendar event: which occurrence, how long before it to be reminded, and whether a new
@@ -205,12 +217,28 @@ object Reminders {
         task.dueAt?.let { if (task.dueHasTime) it else it + TimeUnit.HOURS.toMillis(9) }
 
     fun schedule(context: Context, task: TaskItem) {
+        scheduleMoveOn(context, task)
         val at = triggerAt(task)
         if (at == null || task.done || at <= System.currentTimeMillis()) {
-            cancel(context, task.id)
+            cancelReminder(context, task.id)
             return
         }
         setAlarm(context, task, at)
+    }
+
+    /**
+     * "Before every <event>": when the meeting starts, move the task on to the next one if it's still open.
+     * Separate from the reminder so arming it never resets a snoozed reminder.
+     */
+    fun scheduleMoveOn(context: Context, task: TaskItem) {
+        val alarms = context.getSystemService(AlarmManager::class.java)
+        val begin = task.eventBegin
+        val pending = moveOnIntent(context, task.id)
+        if (task.done || !task.eventRepeats || begin == null || begin <= System.currentTimeMillis()) {
+            alarms.cancel(pending)
+        } else {
+            alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, begin + 60_000, pending)
+        }
     }
 
     /** Ring again in [minutes], whatever the due date says. */
@@ -231,8 +259,21 @@ object Reminders {
     }
 
     fun cancel(context: Context, taskId: Long) {
+        cancelReminder(context, taskId)
+        context.getSystemService(AlarmManager::class.java).cancel(moveOnIntent(context, taskId))
+    }
+
+    private fun cancelReminder(context: Context, taskId: Long) {
         context.getSystemService(AlarmManager::class.java).cancel(pendingIntent(context, taskId))
     }
+
+    private fun moveOnIntent(context: Context, taskId: Long): PendingIntent =
+        PendingIntent.getBroadcast(
+            context,
+            taskId.toInt(),
+            TaskActionReceiver.intent(context, TaskActionReceiver.ACTION_MOVE_ON),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
 
     private fun pendingIntent(context: Context, taskId: Long): PendingIntent =
         PendingIntent.getBroadcast(
@@ -279,7 +320,7 @@ class TaskActionReceiver : BroadcastReceiver() {
                 val task = db.tasks().get(intent.getLongExtra(EXTRA_TASK_ID, -1)) ?: return
                 TaskStore.complete(context, task)
             }
-            ACTION_SYNC_EVENTS -> EventSync.refresh(context)
+            ACTION_SYNC_EVENTS, ACTION_MOVE_ON -> EventSync.refresh(context)
             ACTION_REMIND -> {
                 val task = db.tasks().get(intent.getLongExtra(EXTRA_TASK_ID, -1)) ?: return
                 if (task.done) return
@@ -300,6 +341,7 @@ class TaskActionReceiver : BroadcastReceiver() {
         const val ACTION_MARK_DONE = "app.instantrecorder.action.MARK_DONE"
         const val ACTION_REMIND = "app.instantrecorder.action.REMIND"
         const val ACTION_SYNC_EVENTS = "app.instantrecorder.action.SYNC_EVENTS"
+        const val ACTION_MOVE_ON = "app.instantrecorder.action.MOVE_ON"
         const val ACTION_SNOOZE = "app.instantrecorder.action.SNOOZE"
         const val EXTRA_RECORDING_ID = "recordingId"
         const val EXTRA_TASK_ID = "taskId"

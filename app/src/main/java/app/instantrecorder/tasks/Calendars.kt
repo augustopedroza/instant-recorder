@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.provider.CalendarContract
 import android.util.Log
+import app.instantrecorder.Notifications
 import app.instantrecorder.app
 import java.time.ZoneId
 import java.util.concurrent.TimeUnit
@@ -103,7 +104,8 @@ object Calendars {
 
 /**
  * Keeps event-linked reminders on the event: if a (non-repeating) event is moved, the task's due date moves
- * with it. Runs when the app starts, once a day, and after a reboot.
+ * with it, and a "before every <event>" task whose meeting has started moves on to the next one. Runs when
+ * the app starts, once a day, after a reboot, and when such a meeting starts.
  */
 object EventSync {
     suspend fun refresh(context: Context) {
@@ -113,16 +115,22 @@ object EventSync {
         val zone = ZoneId.systemDefault()
         for (task in dao.openLinkedToEvents()) {
             val begin = task.eventBegin ?: continue
-            val offset = task.eventOffsetMinutes ?: continue
+            if (task.eventOffsetMinutes == null) continue
+            if (task.missedItsMeeting(now)) {
+                val next = Calendars.followingOccurrence(context, task.eventId ?: continue, task.eventTitle, now) ?: continue
+                val moved = task.movedTo(next, zone)
+                dao.update(moved)
+                Notifications.cancelReminder(context, task.id) // its Done button would now finish the next meeting's task
+                Reminders.schedule(context, moved)
+                Log.i("EventSync", "Task ${task.id} moved on to the meeting at ${next.begin}")
+                continue
+            }
+            Reminders.scheduleMoveOn(context, task) // tasks saved before 0.11 have no move-on alarm yet
             if (begin < now) continue // that occurrence has passed: leave the task as it is
             val current = Calendars.nextOccurrence(context, task.eventId ?: continue, now - TimeUnit.DAYS.toMillis(1)) ?: continue
             // A moved single occurrence of a series becomes a separate event in the calendar; don't guess.
             if (current.recurring || (current.begin == begin && current.title == task.eventTitle)) continue
-            val due = EventTiming.due(current, offset, zone)
-            val updated = task.copy(
-                dueAt = due.epochMillis, dueHasTime = due.hasTime, eventBegin = current.begin, eventTitle = current.title,
-                eventAllDay = current.allDay,
-            )
+            val updated = task.movedTo(current, zone)
             dao.update(updated)
             Reminders.schedule(context, updated)
             Log.i("EventSync", "Task ${task.id} follows its event to ${current.begin}")

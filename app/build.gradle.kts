@@ -18,7 +18,7 @@ android {
         targetSdk = 36
         // CI passes the commit count so every build installs over the previous one.
         versionCode = providers.gradleProperty("versionCode").orNull?.toInt() ?: 1
-        versionName = "0.10.1"
+        versionName = "0.11.0"
 
         ndk {
             // Pixel phones are arm64-only.
