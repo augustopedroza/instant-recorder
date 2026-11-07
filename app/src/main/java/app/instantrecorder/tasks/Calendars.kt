@@ -46,11 +46,24 @@ object Calendars {
     fun find(context: Context, query: String): EventRef? =
         EventTiming.bestMatch(query, upcoming(context).filter { it.begin > System.currentTimeMillis() })
 
-    /** The next occurrence of [eventId] starting after [from], or null if the event is gone. */
+    /** The first occurrence of [eventId] still running at [from] or starting after it, or null if the event is gone. */
     fun nextOccurrence(context: Context, eventId: Long, from: Long): EventRef? =
         instances(context, from, from + TimeUnit.DAYS.toMillis(800), eventId).firstOrNull()?.first
 
-    private fun instances(context: Context, from: Long, to: Long, eventId: Long?): List<Pair<EventRef, Long>> {
+    /**
+     * Where a "before every <event>" task goes next after the occurrence at [after]: see [EventTiming.nextOccurrence].
+     * Same-name events only count from calendars that are searched.
+     */
+    fun followingOccurrence(context: Context, eventId: Long, title: String?, after: Long): EventRef? {
+        val excluded = context.app.settings.value.excludedCalendarIds
+        val candidates = instances(context, after, after + TimeUnit.DAYS.toMillis(800), eventId, title?.trim()?.takeIf { it.isNotEmpty() })
+            .filter { (ref, calendarId) -> ref.eventId == eventId || calendarId !in excluded }
+            .map { it.first }
+        return EventTiming.nextOccurrence(candidates, eventId, title, after)
+    }
+
+    /** Occurrences overlapping [from]..[to]: of [eventId] if given, or also any titled [title] (ignoring case). */
+    private fun instances(context: Context, from: Long, to: Long, eventId: Long?, title: String? = null): List<Pair<EventRef, Long>> {
         val uri = CalendarContract.Instances.CONTENT_URI.buildUpon().also {
             ContentUris.appendId(it, from)
             ContentUris.appendId(it, to)
@@ -62,10 +75,15 @@ object Calendars {
         )
         val selection = buildString {
             append("${CalendarContract.Instances.VISIBLE} = 1")
-            if (eventId != null) append(" AND ${CalendarContract.Instances.EVENT_ID} = $eventId")
+            when {
+                eventId != null && title != null ->
+                    append(" AND (${CalendarContract.Instances.EVENT_ID} = $eventId OR ${CalendarContract.Instances.TITLE} = ? COLLATE NOCASE)")
+                eventId != null -> append(" AND ${CalendarContract.Instances.EVENT_ID} = $eventId")
+            }
         }
+        val args = if (eventId != null && title != null) arrayOf(title) else null
         return try {
-            context.contentResolver.query(uri, projection, selection, null, "${CalendarContract.Instances.BEGIN} ASC")?.use { cur ->
+            context.contentResolver.query(uri, projection, selection, args, "${CalendarContract.Instances.BEGIN} ASC")?.use { cur ->
                 buildList {
                     while (cur.moveToNext()) {
                         val ref = EventRef(
@@ -101,7 +119,10 @@ object EventSync {
             // A moved single occurrence of a series becomes a separate event in the calendar; don't guess.
             if (current.recurring || (current.begin == begin && current.title == task.eventTitle)) continue
             val due = EventTiming.due(current, offset, zone)
-            val updated = task.copy(dueAt = due.epochMillis, dueHasTime = due.hasTime, eventBegin = current.begin, eventTitle = current.title)
+            val updated = task.copy(
+                dueAt = due.epochMillis, dueHasTime = due.hasTime, eventBegin = current.begin, eventTitle = current.title,
+                eventAllDay = current.allDay,
+            )
             dao.update(updated)
             Reminders.schedule(context, updated)
             Log.i("EventSync", "Task ${task.id} follows its event to ${current.begin}")

@@ -62,8 +62,10 @@ import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Event
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -114,6 +116,8 @@ import app.instantrecorder.data.Settings
 import app.instantrecorder.data.TaskItem
 import app.instantrecorder.data.volumeGestureHint
 import app.instantrecorder.tasks.Due
+import app.instantrecorder.tasks.EventLink
+import app.instantrecorder.tasks.eventLink
 import app.instantrecorder.tasks.Repeat
 import app.instantrecorder.tasks.TaskIntents
 import app.instantrecorder.transcribe.WhisperModel
@@ -142,9 +146,16 @@ fun HomeScreen(vm: MainViewModel) {
     val doneTasks = remember(tasks) { tasks.filter { it.done }.sortedByDescending { it.completedAt ?: it.createdAt } }
 
     val snackbar = remember { SnackbarHostState() }
+    // A repeating task just checked off: the pop-up saying when the next one is.
+    var finishedRepeating by remember { mutableStateOf<Completion?>(null) }
     // Shows "… · Undo" for every undoable action: deletes anywhere in the app, checking a task off or back on.
     LaunchedEffect(Unit) {
         vm.undoables.collect { item ->
+            if (item is Completion && item.repeating) {
+                finishedRepeating?.let(vm::commit) // a second one replaces the first pop-up
+                finishedRepeating = item
+                return@collect
+            }
             launch {
                 // A newer delete takes over the snackbar, which commits the previous one.
                 snackbar.currentSnackbarData?.dismiss()
@@ -158,6 +169,16 @@ fun HomeScreen(vm: MainViewModel) {
                 }
             }
         }
+    }
+
+    finishedRepeating?.let { item ->
+        AlertDialog(
+            onDismissRequest = { finishedRepeating = null; vm.commit(item) },
+            title = { Text("Done!") },
+            text = { Text(item.nextReminder) },
+            confirmButton = { TextButton(onClick = { finishedRepeating = null; vm.commit(item) }) { Text("OK") } },
+            dismissButton = { TextButton(onClick = { finishedRepeating = null; vm.undo(item) }) { Text("Undo") } },
+        )
     }
 
     // Runs a recording action once the microphone is allowed (asking first if needed).
@@ -537,7 +558,7 @@ private fun TaskRow(
                     }
                     category?.let { CategoryLabel(it) }
                     if (task.repeatDays != Repeat.NONE) RepeatLabel(task.repeatDays)
-                    task.eventTitle?.let { EventLabel(if (task.eventRepeats) "Every $it" else it) }
+                    task.eventLink?.let { EventLabel(it) }
                 }
             }
         },
@@ -660,13 +681,20 @@ private fun RecordButton(onQuickNote: () -> Unit, onLongRecording: () -> Unit) {
     }
 }
 
-/** "📅 Board meeting": this task's reminder follows that calendar event. */
+/**
+ * "📅 1 week before Ward Council on Sun, Nov 8": the meeting this task's reminder follows. A repeat icon
+ * instead when a new task follows for every meeting by that name.
+ */
 @Composable
-private fun EventLabel(eventTitle: String) {
+private fun EventLabel(link: EventLink) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        Icon(Icons.Filled.Event, contentDescription = "Before the event", Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Icon(
+            if (link.everyTime) Icons.Filled.Repeat else Icons.Filled.Event,
+            contentDescription = if (link.everyTime) "Repeats for every ${link.event.title}" else null,
+            Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Text(
-            eventTitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            link.describe(), maxLines = 2, overflow = TextOverflow.Ellipsis,
             style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }

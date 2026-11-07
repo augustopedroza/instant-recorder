@@ -52,6 +52,8 @@ data class TaskItem(
     val eventOffsetMinutes: Int? = null,
     /** Repeat for every occurrence of the (repeating) event: checking it off creates the one for the next. */
     @ColumnInfo(defaultValue = "0") val eventRepeats: Boolean = false,
+    /** The event is all-day, so [eventBegin] is UTC midnight of its date rather than a local time. */
+    @ColumnInfo(defaultValue = "0") val eventAllDay: Boolean = false,
     /** Remind like an alarm: alarm sound, through Do Not Disturb, full screen when locked. */
     @ColumnInfo(defaultValue = "0") val important: Boolean = false,
     /** When it was checked off; null while open. Orders the Done tab. */
@@ -160,7 +162,7 @@ interface CategoryDao {
     suspend fun delete(category: Category)
 }
 
-@Database(entities = [Recording::class, TaskItem::class, Category::class], version = 7, exportSchema = false)
+@Database(entities = [Recording::class, TaskItem::class, Category::class], version = 8, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun recordings(): RecordingDao
     abstract fun tasks(): TaskDao
@@ -220,6 +222,13 @@ abstract class AppDatabase : RoomDatabase() {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE `tasks` ADD COLUMN `completedAt` INTEGER")
                 db.execSQL("UPDATE `tasks` SET `completedAt` = `createdAt` WHERE `done` = 1")
+            }
+        }
+
+        /** v8: whether a task's event is all-day, to show the event's own date. */
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `tasks` ADD COLUMN `eventAllDay` INTEGER NOT NULL DEFAULT 0")
             }
         }
 

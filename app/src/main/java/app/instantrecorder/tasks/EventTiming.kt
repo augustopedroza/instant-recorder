@@ -4,6 +4,8 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 /**
  * "3 days before Sarah's birthday", as said: [query] is the event to look up, [phrase] the words used.
@@ -27,6 +29,20 @@ object EventTiming {
     const val DAY = 24 * HOUR
     const val WEEK = 7 * DAY
 
+    /**
+     * The occurrence a "before every <event>" task moves on to once [eventId]'s occurrence at [after] is done:
+     * the earliest that *starts* after it (a calendar range query also returns meetings still in progress), of
+     * the same event or of any event with the same name. One name can span several series (Ward Council on
+     * 2nd and 4th Sundays), and editing "this and following events" splits a series into a new event.
+     * On a tie (the same meeting in two calendars) the task's own event wins.
+     */
+    fun nextOccurrence(candidates: List<EventRef>, eventId: Long, title: String?, after: Long): EventRef? {
+        val name = title?.trim()?.takeIf { it.isNotEmpty() }
+        return candidates
+            .filter { it.begin > after && (it.eventId == eventId || (name != null && it.title.trim().equals(name, ignoreCase = true))) }
+            .minWithOrNull(compareBy<EventRef>({ it.begin }, { if (it.eventId == eventId) 0 else 1 }))
+    }
+
     /** Common choices for picking an offset by hand. */
     val PRESETS = listOf(2 * HOUR, DAY, 2 * DAY, 3 * DAY, WEEK, 2 * WEEK)
 
@@ -46,6 +62,10 @@ object EventTiming {
 
     fun eventDate(event: EventRef, zone: ZoneId): LocalDate =
         Instant.ofEpochMilli(event.begin).atZone(if (event.allDay) ZoneOffset.UTC else zone).toLocalDate()
+
+    /** "Sun, Nov 8": the event's own date (an all-day event's calendar day, not the UTC instant's local day). */
+    fun dateLabel(event: EventRef, zone: ZoneId, locale: Locale = Locale.getDefault()): String =
+        eventDate(event, zone).format(DateTimeFormatter.ofPattern("EEE, MMM d", locale))
 
     fun describe(offsetMinutes: Int): String = when {
         offsetMinutes % WEEK == 0 -> plural(offsetMinutes / WEEK, "week")

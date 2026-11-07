@@ -36,6 +36,7 @@ object TaskStore {
                 eventBegin = linked?.begin,
                 eventOffsetMinutes = it.event?.offsetMinutes?.takeIf { linked != null },
                 eventRepeats = it.event?.everyTime == true && linked?.recurring == true,
+                eventAllDay = linked?.allDay == true,
                 important = it.important,
             )
         }
@@ -66,18 +67,18 @@ object TaskStore {
     }
 
     /**
-     * The task for the event's next upcoming occurrence (after this one and after now, so finishing late
-     * doesn't create tasks for meetings already past). Null if the series ended or the calendar isn't readable.
+     * The task for the next meeting by that name (starting after this one and after now, so finishing late
+     * doesn't create tasks for meetings already past). Null if none is coming up or the calendar isn't readable.
      */
     private fun nextForEvent(context: Context, task: TaskItem): TaskItem? {
         val eventId = task.eventId ?: return null
         val offset = task.eventOffsetMinutes ?: return null
-        val after = maxOf(task.eventBegin ?: 0, System.currentTimeMillis()) + 60_000
-        val event = Calendars.nextOccurrence(context, eventId, after) ?: return null
+        val after = maxOf(task.eventBegin ?: 0, System.currentTimeMillis())
+        val event = Calendars.followingOccurrence(context, eventId, task.eventTitle, after) ?: return null
         val due = EventTiming.due(event, offset, java.time.ZoneId.systemDefault())
         return task.copy(
             id = 0, done = false, createdAt = System.currentTimeMillis(), dueAt = due.epochMillis, dueHasTime = due.hasTime,
-            eventBegin = event.begin, eventTitle = event.title,
+            eventId = event.eventId, eventBegin = event.begin, eventTitle = event.title, eventAllDay = event.allDay,
         )
     }
 
@@ -125,6 +126,7 @@ object TaskStore {
             title = title, notes = notes, dueAt = due?.epochMillis, dueHasTime = due?.hasTime ?: false, categoryId = categoryId,
             repeatDays = repeatDays, eventId = link?.event?.eventId, eventTitle = link?.event?.title,
             eventBegin = link?.event?.begin, eventOffsetMinutes = link?.offsetMinutes, eventRepeats = link?.everyTime == true,
+            eventAllDay = link?.event?.allDay == true,
             important = important,
         )
         dao.update(updated)
@@ -145,14 +147,16 @@ fun Category.rule() = CategoryRule(id, name, keywordList)
  * task follows for every occurrence ([everyTime], only meaningful for repeating events).
  */
 data class EventLink(val event: EventRef, val offsetMinutes: Int, val everyTime: Boolean = false) {
-    fun describe() = "${EventTiming.describe(offsetMinutes)} ${if (everyTime) "every " else ""}${event.title}"
+    /** "1 week before Ward Council on Sun, Nov 8": which meeting, not just which event. */
+    fun describe(zone: java.time.ZoneId = java.time.ZoneId.systemDefault()) =
+        "${EventTiming.describe(offsetMinutes)} ${event.title} on ${EventTiming.dateLabel(event, zone)}"
 }
 
 /** The link stored on [this] task, if any. */
 val TaskItem.eventLink: EventLink?
     get() = if (eventId != null && eventBegin != null && eventOffsetMinutes != null) {
         // Only repeating events can repeat, so a stored "every time" also tells us the event repeats.
-        EventLink(EventRef(eventId, eventTitle.orEmpty(), eventBegin, allDay = false, recurring = eventRepeats), eventOffsetMinutes, eventRepeats)
+        EventLink(EventRef(eventId, eventTitle.orEmpty(), eventBegin, allDay = eventAllDay, recurring = eventRepeats), eventOffsetMinutes, eventRepeats)
     } else {
         null
     }

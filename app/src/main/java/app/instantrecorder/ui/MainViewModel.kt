@@ -15,8 +15,10 @@ import app.instantrecorder.tasks.Due
 import app.instantrecorder.tasks.EventLink
 import app.instantrecorder.tasks.EventRequest
 import app.instantrecorder.tasks.Reminders
+import app.instantrecorder.tasks.Repeat
 import app.instantrecorder.tasks.TaskStore
 import app.instantrecorder.tasks.TaskSuggestion
+import app.instantrecorder.tasks.eventLink
 import app.instantrecorder.transcribe.WhisperLib
 import app.instantrecorder.transcribe.WhisperModel
 import kotlinx.coroutines.Dispatchers
@@ -40,6 +42,17 @@ sealed interface Undoable {
 /** A task checked off and moved to the Done tab; [next] is the occurrence that took over a repeating one. */
 data class Completion(val task: TaskItem, val next: TaskItem?) : Undoable {
     override val message get() = next?.dueAt?.let { "Done · next: ${Due(it, next.dueHasTime).label()}" } ?: "Moved to Done"
+
+    /** Repeating tasks get a pop-up saying when the next one is, instead of a snackbar. */
+    val repeating get() = task.repeatDays != Repeat.NONE || task.eventRepeats
+
+    /** "Next reminder: Sun, Nov 15, 1 week before Ward Council on Sun, Nov 22." */
+    val nextReminder: String
+        get() {
+            val n = next ?: return "There's no upcoming ${task.eventTitle ?: "event"} in your calendar, so there's no next reminder."
+            val due = n.dueAt?.let { Due(it, n.dueHasTime).label() } ?: return "The next one is in your Tasks list."
+            return "Next reminder: $due${n.eventLink?.let { ", ${it.describe()}" }.orEmpty()}."
+        }
 }
 
 /** A finished task unchecked in the Done tab, back in the Tasks list. [task] is how it was while done. */
